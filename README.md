@@ -30,3 +30,10 @@ curl -X POST http://localhost:8080/generate \
   -H "X-API-Key: ${API_KEY_STORAGE}" \
   -d '{"prompt":"Hello","model":"llama-3.1-8b-instant","temperature":0.7,"max_tokens":128}'
 ```
+
+
+## Notes
+
+- `/live` is for container liveness checks (no upstream call).
+- `/health` checks Groq upstream and uses cache (`HEALTH_CACHE_SECONDS`).
+- If you get many `429`, reduce `max_tokens`, lower request rate, or upgrade Groq plan.

@@ -1,6 +1,7 @@
 import hmac
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -96,6 +97,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger("groq-service")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
@@ -161,13 +163,48 @@ def _upstream_status_from_error(exc: Exception) -> Optional[int]:
     return status_code
 
 
+def _error_text(exc: Exception) -> str:
+    parts = [str(exc)]
+    body = getattr(exc, "body", None)
+    if body is not None:
+        parts.append(str(body))
+    return " ".join(part for part in parts if part).lower()
+
+
+def _is_rate_limit_style_error(exc: Exception, upstream_status: Optional[int]) -> bool:
+    if isinstance(exc, groq.RateLimitError) or upstream_status == 429:
+        return True
+    if upstream_status != 413:
+        return False
+
+    text = _error_text(exc)
+    return (
+        "rate_limit_exceeded" in text
+        or "tokens per minute" in text
+        or "request too large for model" in text
+    )
+
+
+def _extract_retry_after_seconds(exc: Exception) -> Optional[float]:
+    # Groq often sends: "Please try again in 11.41s" or "Please try again in 970ms"
+    text = _error_text(exc)
+    match = re.search(r"please\\s+try\\s+again\\s+in\\s+([0-9]*\\.?[0-9]+)\\s*(ms|s)\\b", text)
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2)
+    if unit == "ms":
+        value /= 1000.0
+    return max(0.0, value)
+
+
 def _map_upstream_error(exc: Exception) -> Tuple[int, str, str, Optional[int]]:
     upstream_status = _upstream_status_from_error(exc)
 
     if isinstance(exc, (groq.AuthenticationError, groq.PermissionDeniedError)) or upstream_status in (401, 403):
         return 401, "upstream_auth_error", "Groq upstream authentication failed", upstream_status
 
-    if isinstance(exc, groq.RateLimitError) or upstream_status == 429:
+    if _is_rate_limit_style_error(exc, upstream_status):
         return 429, "upstream_rate_limit", "Groq upstream rate limit exceeded", 429
 
     if isinstance(exc, (groq.APITimeoutError, groq.APIConnectionError)):
@@ -190,7 +227,7 @@ def _should_retry_upstream(exc: Exception) -> bool:
         return True
 
     status_code = _upstream_status_from_error(exc)
-    if status_code == 429:
+    if _is_rate_limit_style_error(exc, status_code):
         return True
     if status_code is not None and status_code >= 500:
         return True
@@ -376,6 +413,11 @@ def health():
     )
 
 
+@app.route("/live", methods=["GET"])
+def live():
+    return _json_response({"status": "ok"}, 200)
+
+
 @app.route("/models", methods=["GET"])
 @require_api_key
 def list_models():
@@ -454,7 +496,12 @@ def generate():
             )
 
             if should_retry:
-                delay = GROQ_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+                backoff_delay = GROQ_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+                retry_after_delay = _extract_retry_after_seconds(exc)
+                if retry_after_delay is not None:
+                    delay = max(backoff_delay, retry_after_delay)
+                else:
+                    delay = backoff_delay
                 time.sleep(delay)
                 continue
 
